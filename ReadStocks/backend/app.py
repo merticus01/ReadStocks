@@ -1,22 +1,28 @@
 """
 ReadStocks API - FastAPI backend for stock data.
 Supports Lovable/Bolt AI frontends via REST + WebSocket.
+Real-time streaming via Finnhub WebSocket for live updates.
 """
 import os
 import json
+import asyncio
 import logging
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import redis
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
 from sqlalchemy.orm import Session
 
-from database import SessionLocal, engine, get_db
-from models import Base, Stock
+from backend.database import SessionLocal, engine, get_db
+from backend.models import Base, Stock
+from backend.finnhub_ws import get_manager, register_update_callback, unregister_update_callback
 
 load_dotenv()
 
@@ -24,6 +30,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+API_KEY = os.getenv("API_KEY", "")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
@@ -41,9 +48,22 @@ except Exception:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Startup
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables created.")
+    
+    # Initialize Finnhub WebSocket Manager
+    manager = get_manager()
+    ws_thread = threading.Thread(target=manager.run_forever, daemon=True)
+    ws_thread.start()
+    logger.info("Finnhub WebSocket manager started in background thread.")
+    
     yield
+    
+    # Shutdown
+    if manager.ws:
+        manager.ws.close()
+    logger.info("Finnhub WebSocket manager shut down.")
 
 
 app = FastAPI(
@@ -52,6 +72,40 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    openapi_schema.setdefault("components", {})
+    openapi_schema["components"]["securitySchemes"] = {
+        "ApiKeyHeader": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-API-Key",
+        },
+        "RapidAPIKeyHeader": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-RapidAPI-Key",
+        },
+    }
+    openapi_schema["security"] = [
+        {"ApiKeyHeader": []},
+        {"RapidAPIKeyHeader": []},
+    ]
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 # Allow all origins for local dev / AI-generated frontends.
@@ -80,6 +134,30 @@ def _cache_get(key: str) -> Optional[dict]:
 def _cache_set(key: str, data: dict, ttl: int = 10):
     if REDIS_AVAILABLE:
         redis_client.setex(key, ttl, json.dumps(data))
+
+
+def _get_request_api_key(request: Request) -> Optional[str]:
+    return (
+        request.headers.get("x-api-key")
+        or request.headers.get("x-rapidapi-key")
+        or request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+        or request.query_params.get("api_key")
+    )
+
+
+EXEMPT_PATHS = {"/health", "/docs", "/openapi.json", "/redoc"}
+
+
+@app.middleware("http")
+async def validate_api_key(request: Request, call_next):
+    if not API_KEY or request.url.path in EXEMPT_PATHS:
+        return await call_next(request)
+
+    key = _get_request_api_key(request)
+    if key != API_KEY:
+        return JSONResponse({"detail": "Invalid or missing API key."}, status_code=401)
+
+    return await call_next(request)
 
 
 def _finnhub_get(path: str, params: dict) -> dict:
@@ -201,50 +279,101 @@ def search_stocks(q: str):
 
 class ConnectionManager:
     def __init__(self):
-        self.active: list[WebSocket] = []
+        self.active: dict[str, list[WebSocket]] = {}  # ticker -> [websockets]
 
-    async def connect(self, ws: WebSocket):
+    async def connect(self, ticker: str, ws: WebSocket):
         await ws.accept()
-        self.active.append(ws)
+        if ticker not in self.active:
+            self.active[ticker] = []
+        self.active[ticker].append(ws)
+        
+        # Subscribe to ticker in Finnhub
+        manager = get_manager()
+        manager.subscribe(ticker)
+        logger.info(f"WebSocket client connected for {ticker}. Active connections: {len(self.active[ticker])}")
 
-    def disconnect(self, ws: WebSocket):
-        self.active.remove(ws)
+    def disconnect(self, ticker: str, ws: WebSocket):
+        if ticker in self.active and ws in self.active[ticker]:
+            self.active[ticker].remove(ws)
+            if not self.active[ticker]:
+                # Unsubscribe if no more clients
+                manager = get_manager()
+                manager.unsubscribe(ticker)
+                del self.active[ticker]
+                logger.info(f"All clients disconnected from {ticker}, unsubscribing.")
+            else:
+                logger.info(f"WebSocket client disconnected from {ticker}. Active: {len(self.active[ticker])}")
 
-    async def broadcast(self, data: dict):
-        for ws in list(self.active):
+    async def broadcast(self, ticker: str, data: dict):
+        """Broadcast update to all clients watching this ticker."""
+        if ticker not in self.active:
+            return
+        
+        for ws in list(self.active[ticker]):
             try:
                 await ws.send_json(data)
-            except Exception:
-                self.active.remove(ws)
+            except Exception as e:
+                logger.warning(f"Failed to send to client: {e}")
+                self.active[ticker].remove(ws)
 
 
-manager = ConnectionManager()
+manager_conn = ConnectionManager()
+
+
+async def price_update_callback(update: dict):
+    """Callback triggered when Finnhub sends a price update."""
+    ticker = update.get("ticker")
+    if ticker:
+        await manager_conn.broadcast(ticker, update)
 
 
 @app.websocket("/ws/{ticker}")
 async def websocket_ticker(websocket: WebSocket, ticker: str):
     """
-    WebSocket endpoint. Connect to receive live price updates for a ticker.
-    The server polls Finnhub every 5 seconds and pushes updates.
+    WebSocket endpoint for real-time price updates.
+    Receives live trade data from Finnhub WebSocket and streams to client.
     """
-    import asyncio
+    if API_KEY:
+        ws_key = (
+            websocket.headers.get("x-api-key")
+            or websocket.headers.get("x-rapidapi-key")
+            or websocket.query_params.get("api_key")
+        )
+        if ws_key != API_KEY:
+            await websocket.close(code=1008)
+            return
+
     ticker = ticker.upper()
-    await websocket.accept()
-    logger.info("WS client connected for %s", ticker)
+    await manager_conn.connect(ticker, websocket)
+    
+    # Register callback for this connection
+    await register_update_callback(price_update_callback)
+    
     try:
+        # Keep connection alive and wait for client messages
         while True:
-            try:
-                data = _finnhub_get("quote", {"symbol": ticker})
-                await websocket.send_json({
-                    "ticker": ticker,
-                    "price": data.get("c"),
-                    "change": data.get("d"),
-                    "percent_change": data.get("dp"),
-                })
-            except HTTPException as e:
-                await websocket.send_json({"error": e.detail})
-            except Exception as e:
-                await websocket.send_json({"error": str(e)})
-            await asyncio.sleep(5)
+            # Receive messages (client might send ping/control messages)
+            data = await websocket.receive_text()
+            msg = json.loads(data)
+            
+            # Handle special messages
+            if msg.get("action") == "subscribe":
+                new_ticker = msg.get("ticker", "").upper()
+                if new_ticker:
+                    await manager_conn.connect(new_ticker, websocket)
+                    logger.info(f"Client subscribed to additional ticker: {new_ticker}")
+            elif msg.get("action") == "unsubscribe":
+                unsub_ticker = msg.get("ticker", "").upper()
+                if unsub_ticker:
+                    manager_conn.disconnect(unsub_ticker, websocket)
+                    logger.info(f"Client unsubscribed from ticker: {unsub_ticker}")
+                    
     except WebSocketDisconnect:
-        logger.info("WS client disconnected for %s", ticker)
+        logger.info(f"WS client disconnected from {ticker}")
+        manager_conn.disconnect(ticker, websocket)
+        await unregister_update_callback(price_update_callback)
+    except json.JSONDecodeError:
+        logger.warning("Received invalid JSON from WebSocket client")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        manager_conn.disconnect(ticker, websocket)
