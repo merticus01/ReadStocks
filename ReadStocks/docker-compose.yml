@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      - DATABASE_URL=postgresql://user:password@postgres/stocks
+  
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: stocks
+    ports:
+      - "5432:5432"
+  
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"

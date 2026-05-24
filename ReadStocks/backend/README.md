@@ -11,7 +11,21 @@ Sign up at [finnhub.io](https://finnhub.io) — the free tier covers all endpoin
 ```bash
 cp .env.example .env
 # Edit .env and set FINNHUB_API_KEY=your_key
+# Set API_KEY to a shared application key for all clients
 ```
+
+Add this to `backend/.env`:
+```env
+API_KEY=your_secret_key_here
+```
+
+RapidAPI users can send either header:
+```http
+X-API-Key: your_secret_key_here
+X-RapidAPI-Key: your_secret_key_here
+```
+
+The API OpenAPI docs now declare these auth headers, so `/docs` will show the required security scheme for clients.
 
 ### 3. Run with Docker Compose (recommended)
 ```bash
@@ -52,9 +66,15 @@ The API has **CORS open for all origins** by default (configurable via `ALLOWED_
 
 Example fetch call:
 ```js
-const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/stock/AAPL`)
+const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/stock/AAPL`, {
+  headers: {
+    "X-API-Key": process.env.NEXT_PUBLIC_API_KEY,
+  },
+})
 const { current_price, percent_change } = await res.json()
 ```
+
+If you use RapidAPI, send the same key as `X-RapidAPI-Key`.
 
 ## Architecture
 
