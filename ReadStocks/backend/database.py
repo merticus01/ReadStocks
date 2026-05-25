@@ -5,7 +5,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/stocks")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://readstocks_user:Tb9O0IfQc3FGTz5prBnAPb4QNxduYjO5@dpg-d89l8en7f7vs73cb25r0-a/readstocks")
+
+# "postgresql://user:password@localhost:5432/stocks"
 
 # SQLite needs check_same_thread=False; other DBs don't need it.
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
